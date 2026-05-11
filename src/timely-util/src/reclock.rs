@@ -254,14 +254,17 @@ where
         use timely::progress::ChangeBatch;
         let mut remap_accum_buffer: ChangeBatch<(IntoTime, FromTime)> = ChangeBatch::new();
 
-        // The operator drains `remap_input` and organizes new bindings that are not beyond
-        // `remap_input`'s frontier into the time ordered `remap_trace`.
+        // The operator drains `remap_input`, consolidating new bindings into `pending_remap`.
+        // 
+        // Then, any pending bindings (`pending_remap`) just passed by the advancing `remap_input` frontier
+        // get organized into the time-ordered `remap_trace`.
         //
-        // All received data events can either be reclocked to a time included in the
-        // `remap_trace`, or deferred until new associations are minted. Each data event that
-        // happens at some `FromTime` is mapped to the first `IntoTime` whose associated antichain
-        // is not less or equal to the input `FromTime`.
+        // A binding being promoted from `pending_remap` to `remap_trace` gets the earliest `IntoTime` 't'
+        // such that the corresponding frontier R(t) (a `FromTime` antichain) is past* that binding's `FromTime`.
+        // *
+        // [ where "past" means !(R(t) <= s). The frontier is not less-or-equal to the binding's timestamp. ]
         //
+        // 
         // As progress events are received from the `events` input, we can advance our
         // held capability to track the least `IntoTime` a newly received `FromTime` could possibly
         // map to and also compact the maintained `remap_trace` to that time.
