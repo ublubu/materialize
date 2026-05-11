@@ -269,30 +269,52 @@ where
         // held capability to track the least `IntoTime` a newly received `FromTime` could possibly
         // map to and also compact the maintained `remap_trace` to that time.
         move |frontiers| {
+            // ^ There's only one input. `frontiers[0]` is for `remap_input`.
             let Some(cap) = capset.get(0).cloned() else {
                 return;
             };
             let mut output = output.activate();
             let mut session = output.session(&cap);
 
-            // STEP 1. Accept new bindings into `pending_remap`.
-            // Advance all `into` times by `as_of`, and consolidate all updates at that frontier.
+            // STEP 1.
+            // Drain all newly received FromTime-IntoTime bindings (`remap_input`).
+            // Advance everyone up to `as_of` (if they aren't already past it).
+            //   (`as_of` is a 1-element "frontier" that denotes the beginning of <Into>Time.)
+            // Fold everyone into `remap_accum_buffer`, which consolidates entries by summing diffs.
             remap_input.for_each(|_, data| {
                 for (from, mut into, diff) in data.drain(..) {
                     into.advance_by(as_of.borrow());
                     remap_accum_buffer.update((into, from), diff.into_inner());
                 }
             });
-            // Drain consolidated bindings into the `pending_remap` heap.
-            // Only do this once any of the `remap_input` frontier has passed `as_of`.
-            // For as long as the input frontier is less-equal `as_of`, we have no finalized times.
+
+            // Because the input frontier and `as_of` are both frontiers, we can't be certain
+            // that `as_of` is "finalized" (no new input is possible) until the input frontier
+            // has fully^ passed the `as_of` frontier.
+            // ^ The input frontier could be ahead of `as_of` in all but one laggy time dimension.
+            // N.B. `IntoTime` is actually totally ordered, so `as_of` is a one-dimensional frontier
+            //   and this notation can be simplified.
+            //
+            // So, the below condition means, "`as_of` has been finalized."
+            //
+            // Why do we need the precondition?
+            //
+            // "Remap" is a collection of FromTimes bound to the current IntoTime.
+            // As the collection advances through (Into)Time, a given `s: FromTime` is inserted
+            // (diff = +1) at `t: IntoTime` and immediately removed (-1) at `t + increment`.
+            // N.B. For "old" bindings, both `t` and `t + increment` get rolled up to `as_of`.
+            // 
+            // We consolidate old bindings (up to `as_of`), so a lot of these (+1, -1) diff pairs
+            // cancel out in `remap_accum_buffer`. We keep everything in `remap_accum_buffer`
+            // until `as_of` is finalized so we can eliminate as many obsolete bindings as possible.
             if !PartialOrder::less_equal(&frontiers[0].frontier(), &as_of.borrow()) {
                 for ((into, from), diff) in remap_accum_buffer.drain() {
                     pending_remap.push(Reverse((into, from, diff)));
                 }
             }
 
-            // STEP 2. Extract bindings not beyond `remap_frontier` and commit them into `remap_trace`.
+            // STEP 2.
+            // Pop everything with a finalized `IntoTime` and put it into the remap trace.
             let prev_remap_upper =
                 std::mem::replace(&mut remap_upper, frontiers[0].frontier().to_owned());
             while let Some(update) = pending_remap.peek_mut() {
