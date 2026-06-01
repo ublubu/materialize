@@ -371,31 +371,38 @@ where
             //
             //         The steps above only make sense to perform if there are any times for which
             //         we can correctly accumulate the remap trace, which is what we check here.
+
+            // STEP 4
+            // `remap_since` starts at `as_of` and advances as the remapping of `source_frontier`.
+            // `remap_upper` is the `remap_input` frontier.
+            // We need `remap_since`
+            //
+            // This phrasing is weird because "not less_equal" could also mean uncomparable.
+            //   e.g. two antichains spanning different sets of shards
+            //
+            /*
+            Don't do anything if any part of remap_since (old rsf) is >= remap_upper.
+
+            If any part of remap_since is >= remap_upper, we have to wait for remap_upper to advance
+            --because we can still receive remap_input for a time included by remap_since.
+             */
             if remap_since.iter().all(|t| !remap_upper.less_equal(t)) {
                 let mut cur_binding = MutableAntichain::new();
 
                 let mut remap = remap_trace.iter().peekable();
                 let mut reclocked_source_frontier = remap_upper.clone();
 
-                // We go over all the times for which we might need to output data at. These times
-                // are restrticted to the times at which there exists an update in `remap_trace`
-                // and the minimum timestamp for the case where `remap_trace` is completely empty,
-                // in which case the minimum timestamp maps to the empty `FromTime` frontier and
-                // therefore all data events map to that minimum timestamp.
+                // We iterate over all the times we might need to output data:
+                // - 0 (in case `remap_trace` is empty)
+                // - times with an update in `remap_trace`
                 //
-                // The approach taken here will take time proportional to the number of elements in
-                // `remap_trace`. During development an alternative approach was considered where
-                // the updates in `remap_trace` are instead fully materialized into an ordered list
-                // of antichains in which every data update can be binary searched into. The are
-                // two concerns with this alternative approach that led to preferring this one:
-                // 1. Materializing very wide antichains with small differences between them
-                //    needs memory proportial to the number of bindings times the width of the
-                //    antichain.
-                // 2. It locks in the requirement of a totally ordered target timestamp since only
-                //    in that case can one binary search a binding.
-                // The linear scan is expected to be fine due to the run-to-completion nature of
-                // the operator since its cost is amortized among the number of outstanding
-                // updates.
+                // We considered materializing `remap_trace` into an ordered list of antichains for binary search, but:
+                // - Memory efficiency. Antichains could be very wide, and not every element changes with each new IntoTime.
+                // - Binary search means IntoTime must be totally ordered.
+                //
+                // Current implementation is okay because idk.
+                // Something about "run-to-completion operator" and "cost amortized across outstanding updates".
+                // And I assume we're compacting `remap_trace` as we go.
                 let mut min_time = IntoTime::minimum();
                 min_time.advance_by(remap_since.borrow());
                 let mut prev_cur_time = None;
@@ -411,24 +418,22 @@ where
                     && frontier_reclocked)
                     && let Some(cur_time) = interesting_times.next()
                 {
-                    // 4.0. Load updates of `cur_time` from the trace into `cur_binding` to
-                    //      construct the `[FromTime]` frontier that `cur_time` maps to.
+                    // We're at a specific `cur_time: IntoTime`.
+                    // From the remap trace, get the corresponding `FromTime` frontier, `cur_binding`.
                     while let Some((t_from, _, diff)) = remap.next_if(|(_, t, _)| t == cur_time) {
                         binding_buffer.push((t_from.clone(), *diff));
                     }
                     cur_binding.update_iter(binding_buffer.drain(..));
                     let cur_binding = cur_binding.frontier();
 
-                    // 4.1. Extract updates from `new_source_updates`
+                    // Reclock and output all `new_source_updates`
+                    //   from before (not >=) the `cur_binding` frontier.
                     for (data, _, diff) in new_source_updates.extract(cur_binding) {
                         session.give((data, cur_time.clone(), diff));
                     }
 
-                    // 4.2. Extract updates from `deferred_source_updates`.
-                    //      The deferred updates contain all updates that were not able to be
-                    //      reclocked with the bindings until `prev_remap_upper`. For this reason
-                    //      we only need to reconsider these updates when we start looking at new
-                    //      bindings, i.e bindings that are beyond `prev_remap_upper`.
+                    // Reclock and output all `deferred_source_updates`
+                    //   from before (not >=) the `cur_binding` frontier.
                     if prev_remap_upper.less_equal(cur_time) {
                         deferred_source_updates.retain_mut(|batch| {
                             for (data, _, diff) in batch.extract(cur_binding) {
@@ -439,14 +444,20 @@ where
                         })
                     }
 
-                    // 4.3. Reclock `source_frontier`
-                    //      If any FromTime in source frontier could possibly be reclocked to this
-                    //      binding then we must maintain our capability to emit data at that time
-                    //      and not compact past it. Since we iterate over this loop in time order
-                    //      and IntoTime is a total order we only need to perform this step once.
-                    //      Once a `cur_time` is inserted into `reclocked_source_frontier` no more
-                    //      changes can be made to the frontier by inserting times later in the
-                    //      loop.
+                    // By definition, we remap `s: FromTime` to the earliest IntoTime
+                    // with a corresponding FromTime frontier that isn't <= s.
+                    //
+                    // (Question: Is this robust against changes in sharding?
+                    //  What assumptions do we make about the FromTime frontiers?)
+                    //
+                    // If this is the first `cur_binding` frontier that isn't <= s for some s in source_frontier,
+                    // then `cur_time` is the smallest possible IntoTime mapping for new source inputs.
+                    // i.e. `cur_time` is the `IntoTime` analogue of `source_frontier`.
+                    //
+                    // This area is also weird because it uses partial-order syntax for a total-order operation.
+                    //
+                    // We initialized `source_frontier` to `remap_upper`, the current remap input frontier.
+                    // 
                     if !frontier_reclocked
                         && source_frontier
                             .frontier()
