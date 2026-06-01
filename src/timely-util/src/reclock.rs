@@ -327,17 +327,13 @@ where
             }
 
             // STEP 3. Receive new data updates
-            //         The `events` input describes arbitrary progress and data over `FromTime`,
-            //         which must be translated to `IntoTime`. Each `FromTime` can be found as the
-            //         first `IntoTime` associated with a `[FromTime]` that is not less or equal to
-            //         the input `FromTime`. Received events that are not yet associated to an
-            //         `IntoTime` are collected, and formed into a "chain batch": a sequence of
-            //         chains that results from sorting the updates by `FromTime`, and then
-            //         segmenting the sequence at elements where the partial order on `FromTime` is
-            //         violated.
+            // 1. Get all the progress events. Consolidate them and apply to `source_frontier`.
+            //
+            // 2. Get all the data events. Group them into chains (by `FromTime`).
+            // We want to process older events before newer events.
+            // But `FromTime` is not a total order, so we can't produce a single sorted list.
+            // Instead, we sort the data events into a set of (maybe mutually incomparable) chains.
             let mut stash = Vec::new();
-            // Consolidate progress updates before applying them to `source_frontier`, to avoid quadratic
-            // behavior in overload scenarios.
             let mut change_batch = ChangeBatch::<FromTime, 2>::default();
             while let Some(event) = events.pull() {
                 match event {
@@ -347,7 +343,19 @@ where
                     Event::Messages(_, data) => stash.append(data),
                 }
             }
+            // `source_frontier` checks every incoming update against every element of the antichain
+            // to maybe mark itself as dirty (i.e. needs to rebuild the antichain).
+            // `change_batch` consolidates updates so matching (+1, -1) diffs cancel out,
+            // thus skipping redundant "check against every element of the antichain" operations.
             source_frontier.update_iter(change_batch.drain());
+            // We group and sort the data events into chains (by `FromTime`) like this:
+            //
+            // * 1-dimensional sort using `Ord`.
+            //   [aa, ab, ac, ba, bb, bc, ca, cb, cc]
+            //
+            // * Slice into chains where the partial ordering doesn't hold.
+            //   [aa, ab, ac][ba, bb, bc][ca, cb, cc]
+            //   ^ ("ac" is not comparable to "ba" when the first character means "shard".)
             stash.sort_unstable_by(|(_, t1, _): &(D, FromTime, R), (_, t2, _)| t1.cmp(t2));
             let mut new_source_updates = ChainBatch::from_iter(stash);
 
