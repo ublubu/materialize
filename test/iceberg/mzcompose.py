@@ -292,6 +292,21 @@ def workflow_large_upsert_batch(c: Composition) -> None:
     )
 
 
+def workflow_overcompaction(c: Composition) -> None:
+    """Regression test for SS-282: an Iceberg sink that resumes against a table
+    whose snapshots record a resume_upper behind the input's since (as_of) must
+    stall with "input compacted past resume upper" rather than silently dropping
+    the gap. Reproduces the issue's scenario by recreating the upstream object
+    while leaving the Iceberg table in the catalog with its old snapshots."""
+    key = _setup(c)
+
+    c.run_testdrive_files(
+        f"--var=s3-access-key={key}",
+        "--var=aws-endpoint=minio:9000",
+        "overcompaction.td",
+    )
+
+
 def workflow_range_noncanonical(c: Composition) -> None:
     """Regression test for database-issues#11330: COPY FROM PARQUET must
     canonicalize range values reconstructed from external Parquet, otherwise
