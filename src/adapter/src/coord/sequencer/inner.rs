@@ -3794,6 +3794,28 @@ impl Coordinator {
             }
         };
 
+        // Re-planning above runs against a system session, which performs no
+        // privilege checks, and `rbac::check_plan` only checked ownership of
+        // the connection itself. Authorize the re-planned definition against
+        // the invoking role before anything reads a secret or dials the
+        // network: otherwise the owner of a connection could point it at an
+        // endpoint they control and have Materialize hand over a secret they
+        // have no USAGE on. This mirrors what `CREATE CONNECTION` requires, so
+        // it covers both secrets the statement introduces and secrets it
+        // leaves in place.
+        let usage_check = {
+            let conn_catalog = self.catalog().for_session(ctx.session());
+            rbac::check_usage(
+                &conn_catalog,
+                ctx.session(),
+                &conn.resolved_ids,
+                &rbac::CREATE_ITEM_USAGE,
+            )
+        };
+        if let Err(err) = usage_check {
+            return ctx.retire(Err(err.into()));
+        }
+
         // `conn` is the whole re-planned connection, so this also rejects a
         // stored value the statement did not touch.
         if let Err(err) = check_connection_details(&conn.details) {

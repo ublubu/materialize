@@ -3658,3 +3658,59 @@ REVOKE SELECT ON mv_owner_plans FROM plan_owner_other
 
 statement ok
 EXPLAIN OPTIMIZED PLAN FOR MATERIALIZED VIEW mv_owner_plans
+
+# ALTER CONNECTION re-plans the whole connection definition, so it must require
+# USAGE on every secret the result references. Ownership alone would let the
+# owner point the connection at a destination they control and have Materialize
+# send it a secret they cannot read.
+
+simple conn=mz_system,user=mz_system
+CREATE SECRET alter_conn_secret AS 'sekret';
+----
+COMPLETE 0
+
+simple conn=mz_system,user=mz_system
+CREATE CONNECTION alter_conn_csr TO CONFLUENT SCHEMA REGISTRY (URL 'https://example.com', USERNAME 'u', PASSWORD SECRET alter_conn_secret) WITH (VALIDATE = false);
+----
+COMPLETE 0
+
+simple conn=mz_system,user=mz_system
+ALTER CONNECTION alter_conn_csr OWNER TO joe;
+----
+COMPLETE 0
+
+simple conn=mz_system,user=mz_system
+GRANT USAGE ON SCHEMA materialize.public TO joe;
+----
+COMPLETE 0
+
+simple conn=joe,user=joe
+ALTER CONNECTION alter_conn_csr SET (URL 'https://redirected.example.com') WITH (VALIDATE = false);
+----
+db error: ERROR: permission denied for SECRET "materialize.public.alter_conn_secret"
+DETAIL: The 'joe' role needs USAGE privileges on SECRET "materialize.public.alter_conn_secret"
+
+simple conn=mz_system,user=mz_system
+GRANT USAGE ON SECRET alter_conn_secret TO joe;
+----
+COMPLETE 0
+
+simple conn=joe,user=joe
+ALTER CONNECTION alter_conn_csr SET (URL 'https://redirected.example.com') WITH (VALIDATE = false);
+----
+COMPLETE 0
+
+simple conn=mz_system,user=mz_system
+DROP CONNECTION alter_conn_csr;
+----
+COMPLETE 0
+
+simple conn=mz_system,user=mz_system
+DROP SECRET alter_conn_secret;
+----
+COMPLETE 0
+
+simple conn=mz_system,user=mz_system
+REVOKE USAGE ON SCHEMA materialize.public FROM joe;
+----
+COMPLETE 0
