@@ -7,13 +7,20 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::net::IpAddr;
+use std::future::Future;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use aws_config::{BehaviorVersion, ConfigLoader};
-use aws_smithy_http_client::tls::{self, rustls_provider::CryptoMode};
-use aws_smithy_runtime_api::client::dns::{DnsFuture, ResolveDns, ResolveDnsError};
 use aws_smithy_runtime_api::client::http::{HttpClient, SharedHttpClient};
+use hyper_util::client::legacy::connect::dns::{GaiResolver, Name};
+use mz_ore::netio::DnsResolutionError;
+use tower::Service;
 
+use crate::http_client::Http1Client;
+
+mod http_client;
 #[cfg(feature = "s3")]
 pub mod s3;
 #[cfg(feature = "s3")]
@@ -40,96 +47,88 @@ pub fn defaults() -> ConfigLoader {
 }
 
 /// Returns an HTTP client for use with the AWS SDK that is appropriately
-/// configured for Materialize.
+/// configured for Materialize. It speaks only HTTP/1.1.
 pub fn http_client() -> impl HttpClient {
-    aws_smithy_http_client::Builder::new()
-        .tls_provider(tls_provider())
-        .build_https()
+    Http1Client::new(GaiResolver::new())
 }
 
-/// Returns an AWS SDK HTTP client whose DNS resolver delegates to
-/// [`mz_ore::netio::resolve_address`].
+/// Returns an AWS SDK HTTP client, like [`http_client`], whose DNS resolver
+/// delegates to [`mz_ore::netio::resolve_address`].
 ///
-/// Only the IP resolution step is overridden. The SDK still uses the original
-/// hostname for SNI and TLS certificate validation, so HTTPS endpoints work
-/// unchanged.
+/// Only the IP resolution step is overridden. The client still uses the
+/// original hostname for SNI and TLS certificate validation, so HTTPS endpoints
+/// work unchanged.
 pub fn http_client_with_resolver(enforce_external_addresses: bool) -> SharedHttpClient {
-    aws_smithy_http_client::Builder::new()
-        .tls_provider(tls_provider())
-        .build_with_resolver(MzAwsResolver {
-            enforce_external_addresses,
-        })
+    SharedHttpClient::new(Http1Client::new(MzAwsResolver {
+        enforce_external_addresses,
+    }))
 }
 
-/// rustls on the aws-lc-rs provider, trusting the system's root certificates.
-fn tls_provider() -> tls::Provider {
-    // TODO(SEC-218): the rest of the workspace is still migrating from OpenSSL
-    // to rustls on aws-lc-rs.
-    tls::Provider::Rustls(CryptoMode::AwsLc)
-}
-
-/// A [`ResolveDns`] implementation that delegates to
+/// A DNS resolver for hyper-util's TCP connector that delegates to
 /// [`mz_ore::netio::resolve_address`], used by [`http_client_with_resolver`].
 #[derive(Clone, Debug)]
 struct MzAwsResolver {
     enforce_external_addresses: bool,
 }
 
-impl MzAwsResolver {
-    async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, mz_ore::netio::DnsResolutionError> {
-        let ips = mz_ore::netio::resolve_address(host, self.enforce_external_addresses).await?;
-        Ok(ips.into_iter().collect())
-    }
-}
+impl Service<Name> for MzAwsResolver {
+    type Response = std::vec::IntoIter<SocketAddr>;
+    type Error = DnsResolutionError;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
-impl ResolveDns for MzAwsResolver {
-    fn resolve_dns<'a>(&'a self, name: &'a str) -> DnsFuture<'a> {
-        DnsFuture::new(async move { self.resolve(name).await.map_err(ResolveDnsError::new) })
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, name: Name) -> Self::Future {
+        let enforce_external_addresses = self.enforce_external_addresses;
+        Box::pin(async move {
+            let ips =
+                mz_ore::netio::resolve_address(name.as_str(), enforce_external_addresses).await?;
+            // hyper-util replaces port 0 with the request's port.
+            let addrs: Vec<_> = ips.into_iter().map(|ip| SocketAddr::new(ip, 0)).collect();
+            Ok(addrs.into_iter())
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use mz_ore::netio::DnsResolutionError;
+    use std::net::IpAddr;
+    use std::str::FromStr;
+
+    use tower::ServiceExt;
 
     use super::*;
+
+    async fn resolve(
+        enforce_external_addresses: bool,
+        host: &str,
+    ) -> Result<Vec<IpAddr>, DnsResolutionError> {
+        let resolver = MzAwsResolver {
+            enforce_external_addresses,
+        };
+        let name = Name::from_str(host).expect("valid name");
+        let addrs = resolver.oneshot(name).await?;
+        Ok(addrs.map(|addr| addr.ip()).collect())
+    }
 
     #[mz_ore::test(tokio::test)]
     #[cfg_attr(miri, ignore)]
     async fn resolver_rejects_loopback_when_enforced() {
-        let resolver = MzAwsResolver {
-            enforce_external_addresses: true,
-        };
-        let err = resolver
-            .resolve("127.0.0.1")
+        let err = resolve(true, "127.0.0.1")
             .await
             .expect_err("must reject loopback");
         assert!(
             matches!(err, DnsResolutionError::PrivateAddress),
             "got {err:?}"
         );
-        let err = resolver
-            .resolve_dns("127.0.0.1")
-            .await
-            .expect_err("must reject loopback");
-        let source = std::error::Error::source(&err).expect("wraps the resolution error");
-        assert!(
-            matches!(
-                source.downcast_ref::<DnsResolutionError>(),
-                Some(DnsResolutionError::PrivateAddress)
-            ),
-            "got {source:?}"
-        );
     }
 
     #[mz_ore::test(tokio::test)]
     #[cfg_attr(miri, ignore)]
     async fn resolver_allows_loopback_when_not_enforced() {
-        let resolver = MzAwsResolver {
-            enforce_external_addresses: false,
-        };
-        let addrs = resolver
-            .resolve_dns("127.0.0.1")
+        let addrs = resolve(false, "127.0.0.1")
             .await
             .expect("loopback should resolve when enforcement is off");
         assert!(addrs.contains(&IpAddr::from([127, 0, 0, 1])));
@@ -138,11 +137,7 @@ mod tests {
     #[mz_ore::test(tokio::test)]
     #[cfg_attr(miri, ignore)]
     async fn resolver_allows_public_when_enforced() {
-        let resolver = MzAwsResolver {
-            enforce_external_addresses: true,
-        };
-        let addrs = resolver
-            .resolve_dns("8.8.8.8")
+        let addrs = resolve(true, "8.8.8.8")
             .await
             .expect("public IP should resolve");
         assert!(addrs.contains(&IpAddr::from([8, 8, 8, 8])));
