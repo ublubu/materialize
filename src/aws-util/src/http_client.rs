@@ -102,7 +102,6 @@ static TLS_CONFIG: LazyLock<rustls::ClientConfig> = LazyLock::new(|| {
 /// into real ones (see `mz_persist::s3`).
 type Timeout = Option<(SharedAsyncSleep, Duration)>;
 
-/// See the module documentation.
 #[derive(Debug)]
 pub(crate) struct Http1Client {
     resolver: Resolver,
@@ -138,11 +137,26 @@ impl HttpClient for Http1Client {
                     (sleep, duration)
                 })
             };
-            SharedHttpConnector::new(Http1Connector::new(
-                self.resolver.clone(),
-                timeout(settings.connect_timeout()),
-                timeout(settings.read_timeout()),
-            ))
+            let connect_timeout = timeout(settings.connect_timeout());
+            let mut tcp = TcpConnector::new_with_resolver(self.resolver.clone());
+            tcp.enforce_http(false);
+            tcp.set_nodelay(true);
+            let https = hyper_rustls::HttpsConnectorBuilder::new()
+                .with_tls_config(TLS_CONFIG.clone())
+                .https_or_http()
+                .enable_http1()
+                .wrap_connector(tcp)
+                .map_future(move |connecting| {
+                    let connect_timeout = connect_timeout.clone();
+                    async move { with_timeout(connecting, connect_timeout, "connect").await? }
+                });
+            let mut builder = Client::builder(TokioExecutor::new());
+            // The pool's idle timeout does nothing without a timer.
+            builder.pool_timer(TokioTimer::new());
+            SharedHttpConnector::new(Http1Connector {
+                client: builder.build(BoxCloneSyncService::new(https)),
+                read_timeout: timeout(settings.read_timeout()),
+            })
         });
         connector.clone()
     }
@@ -169,30 +183,6 @@ struct Http1Connector {
     /// Covers everything from handing the request to the pool until the
     /// response head arrives, including waiting for a connection.
     read_timeout: Timeout,
-}
-
-impl Http1Connector {
-    fn new(resolver: Resolver, connect_timeout: Timeout, read_timeout: Timeout) -> Self {
-        let mut tcp = TcpConnector::new_with_resolver(resolver);
-        tcp.enforce_http(false);
-        tcp.set_nodelay(true);
-        let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(TLS_CONFIG.clone())
-            .https_or_http()
-            .enable_http1()
-            .wrap_connector(tcp)
-            .map_future(move |connecting| {
-                let connect_timeout = connect_timeout.clone();
-                async move { with_timeout(connecting, connect_timeout, "connect").await? }
-            });
-        let mut builder = Client::builder(TokioExecutor::new());
-        // The pool's idle timeout does nothing without a timer.
-        builder.pool_timer(TokioTimer::new());
-        Http1Connector {
-            client: builder.build(BoxCloneSyncService::new(https)),
-            read_timeout,
-        }
-    }
 }
 
 impl HttpConnector for Http1Connector {
