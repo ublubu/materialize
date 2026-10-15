@@ -7,18 +7,17 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::future::Future;
 use std::net::SocketAddr;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 
 use aws_config::{BehaviorVersion, ConfigLoader};
+use aws_smithy_runtime_api::box_error::BoxError;
 use aws_smithy_runtime_api::client::http::{HttpClient, SharedHttpClient};
 use hyper_util::client::legacy::connect::dns::{GaiResolver, Name};
-use mz_ore::netio::DnsResolutionError;
-use tower::Service;
+use tower::ServiceExt;
+use tower::service_fn;
+use tower::util::BoxCloneSyncService;
 
-use crate::http_client::Http1Client;
+use crate::http_client::{Http1Client, Resolver};
 
 mod http_client;
 #[cfg(feature = "s3")]
@@ -49,7 +48,10 @@ pub fn defaults() -> ConfigLoader {
 /// Returns an HTTP client for use with the AWS SDK that is appropriately
 /// configured for Materialize. It speaks only HTTP/1.1.
 pub fn http_client() -> impl HttpClient {
-    Http1Client::new(GaiResolver::new())
+    let resolver = GaiResolver::new()
+        .map_response(|addrs| addrs.collect::<Vec<_>>().into_iter())
+        .map_err(BoxError::from);
+    Http1Client::new(BoxCloneSyncService::new(resolver))
 }
 
 /// Returns an AWS SDK HTTP client, like [`http_client`], whose DNS resolver
@@ -59,37 +61,17 @@ pub fn http_client() -> impl HttpClient {
 /// original hostname for SNI and TLS certificate validation, so HTTPS endpoints
 /// work unchanged.
 pub fn http_client_with_resolver(enforce_external_addresses: bool) -> SharedHttpClient {
-    SharedHttpClient::new(Http1Client::new(MzAwsResolver {
-        enforce_external_addresses,
+    SharedHttpClient::new(Http1Client::new(mz_resolver(enforce_external_addresses)))
+}
+
+/// A DNS resolver that delegates to [`mz_ore::netio::resolve_address`].
+fn mz_resolver(enforce_external_addresses: bool) -> Resolver {
+    BoxCloneSyncService::new(service_fn(move |name: Name| async move {
+        let ips = mz_ore::netio::resolve_address(name.as_str(), enforce_external_addresses).await?;
+        // hyper-util replaces port 0 with the request's port.
+        let addrs: Vec<_> = ips.into_iter().map(|ip| SocketAddr::new(ip, 0)).collect();
+        Ok::<_, BoxError>(addrs.into_iter())
     }))
-}
-
-/// A DNS resolver for hyper-util's TCP connector that delegates to
-/// [`mz_ore::netio::resolve_address`], used by [`http_client_with_resolver`].
-#[derive(Clone, Debug)]
-struct MzAwsResolver {
-    enforce_external_addresses: bool,
-}
-
-impl Service<Name> for MzAwsResolver {
-    type Response = std::vec::IntoIter<SocketAddr>;
-    type Error = DnsResolutionError;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, name: Name) -> Self::Future {
-        let enforce_external_addresses = self.enforce_external_addresses;
-        Box::pin(async move {
-            let ips =
-                mz_ore::netio::resolve_address(name.as_str(), enforce_external_addresses).await?;
-            // hyper-util replaces port 0 with the request's port.
-            let addrs: Vec<_> = ips.into_iter().map(|ip| SocketAddr::new(ip, 0)).collect();
-            Ok(addrs.into_iter())
-        })
-    }
 }
 
 #[cfg(test)]
@@ -97,19 +79,18 @@ mod tests {
     use std::net::IpAddr;
     use std::str::FromStr;
 
-    use tower::ServiceExt;
+    use mz_ore::netio::DnsResolutionError;
 
     use super::*;
 
     async fn resolve(
         enforce_external_addresses: bool,
         host: &str,
-    ) -> Result<Vec<IpAddr>, DnsResolutionError> {
-        let resolver = MzAwsResolver {
-            enforce_external_addresses,
-        };
+    ) -> Result<Vec<IpAddr>, BoxError> {
         let name = Name::from_str(host).expect("valid name");
-        let addrs = resolver.oneshot(name).await?;
+        let addrs = mz_resolver(enforce_external_addresses)
+            .oneshot(name)
+            .await?;
         Ok(addrs.map(|addr| addr.ip()).collect())
     }
 
@@ -120,7 +101,10 @@ mod tests {
             .await
             .expect_err("must reject loopback");
         assert!(
-            matches!(err, DnsResolutionError::PrivateAddress),
+            matches!(
+                err.downcast_ref::<DnsResolutionError>(),
+                Some(DnsResolutionError::PrivateAddress)
+            ),
             "got {err:?}"
         );
     }

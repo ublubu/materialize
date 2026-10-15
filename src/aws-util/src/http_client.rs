@@ -57,7 +57,11 @@ use hyper_util::client::legacy::connect::{
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::net::TcpStream;
 use tower::Service;
+use tower::util::BoxCloneSyncService;
 use tracing::warn;
+
+/// A DNS resolver for hyper-util's TCP connector.
+pub(crate) type Resolver = BoxCloneSyncService<Name, std::vec::IntoIter<SocketAddr>, BoxError>;
 
 /// The cipher suites the SDK's client allows.
 const CIPHER_SUITES: &[rustls::CipherSuite] = &[
@@ -99,15 +103,15 @@ type Timeout = Option<(SharedAsyncSleep, Duration)>;
 
 /// See the module documentation.
 #[derive(Debug)]
-pub(crate) struct Http1Client<R> {
-    resolver: R,
+pub(crate) struct Http1Client {
+    resolver: Resolver,
     /// One connector, and so one connection pool, per pair of connect and read
     /// timeouts, as in the SDK's client.
     connectors: Mutex<BTreeMap<(Option<Duration>, Option<Duration>), SharedHttpConnector>>,
 }
 
-impl<R> Http1Client<R> {
-    pub(crate) fn new(resolver: R) -> Self {
+impl Http1Client {
+    pub(crate) fn new(resolver: Resolver) -> Self {
         Http1Client {
             resolver,
             connectors: Mutex::new(BTreeMap::new()),
@@ -115,13 +119,7 @@ impl<R> Http1Client<R> {
     }
 }
 
-impl<R> HttpClient for Http1Client<R>
-where
-    R: Service<Name> + Clone + Send + Sync + std::fmt::Debug + 'static,
-    R::Response: Iterator<Item = SocketAddr>,
-    R::Future: Send,
-    R::Error: Into<BoxError>,
-{
+impl HttpClient for Http1Client {
     fn http_connector(
         &self,
         settings: &HttpConnectorSettings,
@@ -165,21 +163,15 @@ where
 }
 
 #[derive(Debug)]
-struct Http1Connector<R> {
-    client: Client<ConnectTimeout<R>, SdkBody>,
+struct Http1Connector {
+    client: Client<ConnectTimeout, SdkBody>,
     /// Covers everything from handing the request to the pool until the
     /// response head arrives, including waiting for a connection.
     read_timeout: Timeout,
 }
 
-impl<R> Http1Connector<R>
-where
-    R: Service<Name> + Clone + Send + Sync + 'static,
-    R::Response: Iterator<Item = SocketAddr>,
-    R::Future: Send,
-    R::Error: Into<BoxError>,
-{
-    fn new(resolver: R, connect_timeout: Timeout, read_timeout: Timeout) -> Self {
+impl Http1Connector {
+    fn new(resolver: Resolver, connect_timeout: Timeout, read_timeout: Timeout) -> Self {
         let mut tcp = TcpConnector::new_with_resolver(resolver);
         tcp.enforce_http(false);
         tcp.set_nodelay(true);
@@ -201,13 +193,7 @@ where
     }
 }
 
-impl<R> HttpConnector for Http1Connector<R>
-where
-    R: Service<Name> + Clone + Send + Sync + std::fmt::Debug + 'static,
-    R::Response: Iterator<Item = SocketAddr>,
-    R::Future: Send,
-    R::Error: Into<BoxError>,
-{
+impl HttpConnector for Http1Connector {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
         let mut request = match request.try_into_http1x() {
             Ok(request) => request,
@@ -240,18 +226,12 @@ where
 
 /// Wraps the TLS connector to time out connection setup.
 #[derive(Clone, Debug)]
-struct ConnectTimeout<R> {
-    inner: HttpsConnector<TcpConnector<R>>,
+struct ConnectTimeout {
+    inner: HttpsConnector<TcpConnector<Resolver>>,
     timeout: Timeout,
 }
 
-impl<R> Service<Uri> for ConnectTimeout<R>
-where
-    R: Service<Name> + Clone + Send + Sync + 'static,
-    R::Response: Iterator<Item = SocketAddr>,
-    R::Future: Send,
-    R::Error: Into<BoxError>,
-{
+impl Service<Uri> for ConnectTimeout {
     type Response = MaybeHttpsStream<TokioIo<TcpStream>>;
     type Error = BoxError;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, BoxError>> + Send>>;
