@@ -150,6 +150,12 @@ impl S3BlobConfig {
         }
 
         if let Some(endpoint) = endpoint {
+            let host = url::Url::parse(&endpoint)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned));
+            if host.as_deref() == Some("storage.googleapis.com") {
+                loader = loader.http_client(mz_aws_util::http1_client());
+            }
             loader = loader.endpoint_url(endpoint)
         }
 

@@ -10,10 +10,7 @@
 //! An AWS SDK HTTP client that speaks only HTTP/1.1.
 //!
 //! The SDK's own hyper 1 client offers HTTP/2 in the TLS handshake and has no
-//! setting to stop it. A server that accepts HTTP/2, like GCS, then gets every
-//! request to a host over one connection. Throughput is capped at what that
-//! connection carries, and requests queue behind the server's limit on
-//! concurrent streams. Over HTTP/1.1, each in-flight request has its own
+//! setting to stop it. Over HTTP/1.1, each in-flight request has its own
 //! connection.
 //!
 //! Otherwise this follows the SDK's client: rustls on aws-lc-rs with the SDK's
@@ -25,7 +22,6 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::future::Future;
-use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -48,7 +44,6 @@ use aws_smithy_types::retry::ErrorKind;
 use http::{Extensions, Uri};
 use hyper_rustls::{ConfigBuilderExt, MaybeHttpsStream};
 use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::dns::Name;
 use hyper_util::client::legacy::connect::{
     CaptureConnection, HttpConnector as TcpConnector, HttpInfo, capture_connection,
 };
@@ -57,9 +52,6 @@ use tokio::net::TcpStream;
 use tower::ServiceExt;
 use tower::util::BoxCloneSyncService;
 use tracing::warn;
-
-/// A DNS resolver for hyper-util's TCP connector.
-pub(crate) type Resolver = BoxCloneSyncService<Name, std::vec::IntoIter<SocketAddr>, BoxError>;
 
 /// The TLS connector, with a timeout on connection setup.
 type Connector = BoxCloneSyncService<Uri, MaybeHttpsStream<TokioIo<TcpStream>>, BoxError>;
@@ -104,16 +96,14 @@ type Timeout = Option<(SharedAsyncSleep, Duration)>;
 
 #[derive(Debug)]
 pub(crate) struct Http1Client {
-    resolver: Resolver,
     /// One connector, and so one connection pool, per pair of connect and read
     /// timeouts, as in the SDK's client.
     connectors: Mutex<BTreeMap<(Option<Duration>, Option<Duration>), SharedHttpConnector>>,
 }
 
 impl Http1Client {
-    pub(crate) fn new(resolver: Resolver) -> Self {
+    pub(crate) fn new() -> Self {
         Http1Client {
-            resolver,
             connectors: Mutex::new(BTreeMap::new()),
         }
     }
@@ -138,7 +128,7 @@ impl HttpClient for Http1Client {
                 })
             };
             let connect_timeout = timeout(settings.connect_timeout());
-            let mut tcp = TcpConnector::new_with_resolver(self.resolver.clone());
+            let mut tcp = TcpConnector::new();
             tcp.enforce_http(false);
             tcp.set_nodelay(true);
             let https = hyper_rustls::HttpsConnectorBuilder::new()
