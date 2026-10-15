@@ -26,9 +26,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use aws_smithy_async::rt::sleep::{AsyncSleep, SharedAsyncSleep, default_async_sleep};
@@ -48,7 +46,7 @@ use aws_smithy_types::config_bag::ConfigBag;
 use aws_smithy_types::error::display::DisplayErrorContext;
 use aws_smithy_types::retry::ErrorKind;
 use http::{Extensions, Uri};
-use hyper_rustls::{ConfigBuilderExt, HttpsConnector, MaybeHttpsStream};
+use hyper_rustls::{ConfigBuilderExt, MaybeHttpsStream};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::dns::Name;
 use hyper_util::client::legacy::connect::{
@@ -56,12 +54,15 @@ use hyper_util::client::legacy::connect::{
 };
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::net::TcpStream;
-use tower::Service;
+use tower::ServiceExt;
 use tower::util::BoxCloneSyncService;
 use tracing::warn;
 
 /// A DNS resolver for hyper-util's TCP connector.
 pub(crate) type Resolver = BoxCloneSyncService<Name, std::vec::IntoIter<SocketAddr>, BoxError>;
+
+/// The TLS connector, with a timeout on connection setup.
+type Connector = BoxCloneSyncService<Uri, MaybeHttpsStream<TokioIo<TcpStream>>, BoxError>;
 
 /// The cipher suites the SDK's client allows.
 const CIPHER_SUITES: &[rustls::CipherSuite] = &[
@@ -164,7 +165,7 @@ impl HttpClient for Http1Client {
 
 #[derive(Debug)]
 struct Http1Connector {
-    client: Client<ConnectTimeout, SdkBody>,
+    client: Client<Connector, SdkBody>,
     /// Covers everything from handing the request to the pool until the
     /// response head arrives, including waiting for a connection.
     read_timeout: Timeout,
@@ -179,15 +180,16 @@ impl Http1Connector {
             .with_tls_config(TLS_CONFIG.clone())
             .https_or_http()
             .enable_http1()
-            .wrap_connector(tcp);
+            .wrap_connector(tcp)
+            .map_future(move |connecting| {
+                let connect_timeout = connect_timeout.clone();
+                async move { with_timeout(connecting, connect_timeout, "connect").await? }
+            });
         let mut builder = Client::builder(TokioExecutor::new());
         // The pool's idle timeout does nothing without a timer.
         builder.pool_timer(TokioTimer::new());
         Http1Connector {
-            client: builder.build(ConnectTimeout {
-                inner: https,
-                timeout: connect_timeout,
-            }),
+            client: builder.build(BoxCloneSyncService::new(https)),
             read_timeout,
         }
     }
@@ -208,50 +210,27 @@ impl HttpConnector for Http1Connector {
         let response = self.client.request(request);
         let read_timeout = self.read_timeout.clone();
         HttpConnectorFuture::new(async move {
-            let response = match read_timeout {
-                Some((sleep, duration)) => tokio::select! {
-                    response = response => response,
-                    () = sleep.sleep(duration) => {
-                        return Err(ConnectorError::timeout(Box::new(TimeoutError("read"))));
-                    }
-                },
-                None => response.await,
-            };
-            let response = response.map_err(|err| classify(&err)(err.into()))?;
+            let response = with_timeout(response, read_timeout, "read")
+                .await
+                .map_err(|err| ConnectorError::timeout(err.into()))?
+                .map_err(|err| classify(&err)(err.into()))?;
             HttpResponse::try_from(response.map(SdkBody::from_body_1_x))
                 .map_err(|err| ConnectorError::other(err.into(), None))
         })
     }
 }
 
-/// Wraps the TLS connector to time out connection setup.
-#[derive(Clone, Debug)]
-struct ConnectTimeout {
-    inner: HttpsConnector<TcpConnector<Resolver>>,
+async fn with_timeout<F: Future>(
+    fut: F,
     timeout: Timeout,
-}
-
-impl Service<Uri> for ConnectTimeout {
-    type Response = MaybeHttpsStream<TokioIo<TcpStream>>;
-    type Error = BoxError;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, BoxError>> + Send>>;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), BoxError>> {
-        self.inner.poll_ready(cx)
-    }
-
-    fn call(&mut self, uri: Uri) -> Self::Future {
-        let connecting = self.inner.call(uri);
-        let timeout = self.timeout.clone();
-        Box::pin(async move {
-            match timeout {
-                Some((sleep, duration)) => tokio::select! {
-                    conn = connecting => conn,
-                    () = sleep.sleep(duration) => Err(Box::new(TimeoutError("connect")).into()),
-                },
-                None => connecting.await,
-            }
-        })
+    kind: &'static str,
+) -> Result<F::Output, TimeoutError> {
+    let Some((sleep, duration)) = timeout else {
+        return Ok(fut.await);
+    };
+    tokio::select! {
+        output = fut => Ok(output),
+        () = sleep.sleep(duration) => Err(TimeoutError(kind)),
     }
 }
 
