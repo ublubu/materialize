@@ -3446,4 +3446,236 @@ mod tests {
         let summary = Trace.expr(&expr);
         assert!(summary.pushdownable());
     }
+
+    /// PER-67: filter pushdown should skip a part whose rows are all too old
+    /// for a time-based filter.
+    ///
+    /// Every test part holds rows dated in the year 2000, and every query runs
+    /// on 2026-01-01, so no row in the part can pass the filter. Pushdown must
+    /// also rule out errors before it skips a part, because skipping would hide
+    /// them. Each filter here calls a function that errors on some inputs. For
+    /// example, comparing a column with `mz_now()` casts it to `mz_timestamp`,
+    /// and that cast errors on times before 1970. None of these functions error
+    /// on year-2000 values, but pushdown assumes such a function may error
+    /// anywhere in a range of values, so it keeps the part and these tests fail.
+    ///
+    /// `select_*` tests model a one-shot SELECT. `mv_*` tests model a
+    /// materialized view.
+    mod per67 {
+        use chrono::{NaiveDate, NaiveDateTime};
+        use mz_repr::Timestamp;
+        use mz_repr::adt::date::Date;
+        use mz_repr::adt::interval::Interval;
+        use mz_repr::adt::numeric::Numeric;
+        use mz_repr::adt::timestamp::CheckedTimestamp;
+
+        use crate::scalar::func::variadic::DateBinTimestamp;
+
+        use super::*;
+
+        fn midnight(year: i32, month: u32, day: u32) -> NaiveDateTime {
+            NaiveDate::from_ymd_opt(year, month, day)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+        }
+
+        fn ts(year: i32, month: u32, day: u32) -> Datum<'static> {
+            Datum::Timestamp(
+                CheckedTimestamp::from_timestamplike(midnight(year, month, day)).unwrap(),
+            )
+        }
+
+        fn tstz(year: i32, month: u32, day: u32) -> Datum<'static> {
+            Datum::TimestampTz(
+                CheckedTimestamp::from_timestamplike(midnight(year, month, day).and_utc()).unwrap(),
+            )
+        }
+
+        fn date(year: i32, month: u32, day: u32) -> Datum<'static> {
+            Datum::Date(Date::try_from(midnight(year, month, day).date()).unwrap())
+        }
+
+        fn mz_ts(year: i32, month: u32, day: u32) -> Datum<'static> {
+            let millis = midnight(year, month, day).and_utc().timestamp_millis();
+            Datum::MzTimestamp(u64::try_from(millis).unwrap().into())
+        }
+
+        /// The part's only column, and the oldest and newest values in it.
+        struct Column {
+            typ: ReprScalarType,
+            oldest: Datum<'static>,
+            newest: Datum<'static>,
+        }
+
+        fn timestamp_column() -> Column {
+            Column {
+                typ: ReprScalarType::Timestamp,
+                oldest: ts(2000, 1, 1),
+                newest: ts(2000, 12, 31),
+            }
+        }
+
+        fn timestamptz_column() -> Column {
+            Column {
+                typ: ReprScalarType::TimestampTz,
+                oldest: tstz(2000, 1, 1),
+                newest: tstz(2000, 12, 31),
+            }
+        }
+
+        fn date_column() -> Column {
+            Column {
+                typ: ReprScalarType::Date,
+                oldest: date(2000, 1, 1),
+                newest: date(2000, 12, 31),
+            }
+        }
+
+        fn mz_timestamp_column() -> Column {
+            Column {
+                typ: ReprScalarType::MzTimestamp,
+                oldest: mz_ts(2000, 1, 1),
+                newest: mz_ts(2000, 12, 31),
+            }
+        }
+
+        fn col() -> MirScalarExpr {
+            MirScalarExpr::column(0)
+        }
+
+        fn lit(datum: Datum, typ: ReprScalarType) -> MirScalarExpr {
+            MirScalarExpr::literal_ok(datum, typ)
+        }
+
+        fn interval(days: i32, micros: i64) -> MirScalarExpr {
+            let interval = Interval {
+                months: 0,
+                days,
+                micros,
+            };
+            lit(Datum::Interval(interval), ReprScalarType::Interval)
+        }
+
+        fn mz_now() -> MirScalarExpr {
+            MirScalarExpr::CallUnmaterializable(UnmaterializableFunc::MzNow)
+        }
+
+        /// What `mz_now()` becomes in a one-shot SELECT.
+        fn query_time() -> MirScalarExpr {
+            lit(mz_ts(2026, 1, 1), ReprScalarType::MzTimestamp)
+        }
+
+        fn le(left: MirScalarExpr, right: MirScalarExpr) -> MirScalarExpr {
+            left.call_binary(right, Lte)
+        }
+
+        fn ge(left: MirScalarExpr, right: MirScalarExpr) -> MirScalarExpr {
+            left.call_binary(right, Gte)
+        }
+
+        /// Asserts that `filter_result` would skip a part holding `column`.
+        fn assert_part_skipped(column: Column, filter: MirScalarExpr) {
+            let arena = RowArena::new();
+            let relation = ReprRelationType::new(vec![column.typ.nullable(false)]);
+            let mut interpreter = ColumnSpecs::new(&relation, &arena);
+            interpreter.push_column(0, ResultSpec::value_between(column.oldest, column.newest));
+            // In a materialized view, `mz_now()` covers every time from
+            // 2026-01-01 on.
+            interpreter.push_unmaterializable(
+                UnmaterializableFunc::MzNow,
+                ResultSpec::value_between(mz_ts(2026, 1, 1), Datum::MzTimestamp(Timestamp::MAX)),
+            );
+            let mfp = MapFilterProject::new(1).filter([filter.clone()]);
+            let plan = MfpPlan::create_from(mfp).expect("valid temporal filter");
+            let result = interpreter.mfp_plan_filter(&plan).range;
+            assert!(
+                !result.may_fail(),
+                "a row could error in {filter:?}: {result:?}",
+            );
+            assert!(
+                !result.may_contain(Datum::True),
+                "a row could pass {filter:?}: {result:?}",
+            );
+        }
+
+        /// `WHERE mz_now() <= ts`
+        #[mz_ore::test]
+        #[cfg_attr(miri, ignore)]
+        fn select_timestamp() {
+            assert_part_skipped(
+                timestamp_column(),
+                le(query_time(), col().call_unary(CastTimestampToMzTimestamp)),
+            );
+        }
+
+        /// `WHERE mz_now() <= tstz`
+        #[mz_ore::test]
+        #[cfg_attr(miri, ignore)]
+        fn select_timestamptz() {
+            assert_part_skipped(
+                timestamptz_column(),
+                le(query_time(), col().call_unary(CastTimestampTzToMzTimestamp)),
+            );
+        }
+
+        /// `WHERE mz_now() <= d`
+        #[mz_ore::test]
+        #[cfg_attr(miri, ignore)]
+        fn select_date() {
+            assert_part_skipped(
+                date_column(),
+                le(query_time(), col().call_unary(CastDateToMzTimestamp)),
+            );
+        }
+
+        /// `WHERE mz_now() <= ts + INTERVAL '1 day'`
+        #[mz_ore::test]
+        #[cfg_attr(miri, ignore)]
+        fn select_timestamp_plus_interval() {
+            let shifted = col().call_binary(interval(1, 0), AddTimestampInterval);
+            assert_part_skipped(
+                timestamp_column(),
+                le(query_time(), shifted.call_unary(CastTimestampToMzTimestamp)),
+            );
+        }
+
+        /// `WHERE extract(epoch FROM ts) >= <2026-01-01 in seconds>`
+        #[mz_ore::test]
+        #[cfg_attr(miri, ignore)]
+        fn select_extract_epoch() {
+            let epoch = col().call_unary(UnaryFunc::ExtractTimestamp(ExtractTimestamp(
+                DateTimeUnits::Epoch,
+            )));
+            let seconds = midnight(2026, 1, 1).and_utc().timestamp();
+            let cutoff = lit(Datum::from(Numeric::from(seconds)), ReprScalarType::Numeric);
+            assert_part_skipped(timestamp_column(), ge(epoch, cutoff));
+        }
+
+        /// `WHERE date_bin('1 minute', ts, '1970-01-01') >= '2026-01-01'`
+        ///
+        /// `date_bin` is also not marked as preserving order, so pushdown
+        /// can't bound its output from the column's oldest and newest values.
+        #[mz_ore::test]
+        #[cfg_attr(miri, ignore)]
+        fn select_date_bin() {
+            let one_minute = interval(0, 60_000_000);
+            let origin = lit(ts(1970, 1, 1), ReprScalarType::Timestamp);
+            let binned =
+                MirScalarExpr::call_variadic(DateBinTimestamp, vec![one_minute, col(), origin]);
+            let cutoff = lit(ts(2026, 1, 1), ReprScalarType::Timestamp);
+            assert_part_skipped(timestamp_column(), ge(binned, cutoff));
+        }
+
+        /// `WHERE mz_now() <= ts` on an `mz_timestamp` column
+        ///
+        /// The column needs no cast, but a materialized view rewrites the
+        /// filter to `mz_now() < step_mz_timestamp(ts)`, and
+        /// `step_mz_timestamp` errors on the largest `mz_timestamp`.
+        #[mz_ore::test]
+        #[cfg_attr(miri, ignore)]
+        fn mv_mz_timestamp() {
+            assert_part_skipped(mz_timestamp_column(), le(mz_now(), col()));
+        }
+    }
 }
