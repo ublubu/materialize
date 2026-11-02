@@ -92,7 +92,11 @@ fn cast_int32_to_mz_timestamp(a: i32) -> Result<Timestamp, EvalError> {
         .map_err(|_| EvalError::MzTimestampOutOfRange(a.to_string().into()))
 }
 
-#[sqlfunc(sqlname = "timestamp_tz_to_mz_timestamp", is_monotone = true)]
+#[sqlfunc(
+    sqlname = "timestamp_tz_to_mz_timestamp",
+    is_monotone = true,
+    has_convex_domain = true
+)]
 fn cast_timestamp_tz_to_mz_timestamp(
     a: CheckedTimestamp<DateTime<Utc>>,
 ) -> Result<Timestamp, EvalError> {
@@ -101,7 +105,11 @@ fn cast_timestamp_tz_to_mz_timestamp(
         .map_err(|_| EvalError::MzTimestampOutOfRange(a.to_string().into()))
 }
 
-#[sqlfunc(sqlname = "timestamp_to_mz_timestamp", is_monotone = true)]
+#[sqlfunc(
+    sqlname = "timestamp_to_mz_timestamp",
+    is_monotone = true,
+    has_convex_domain = true
+)]
 fn cast_timestamp_to_mz_timestamp(
     a: CheckedTimestamp<NaiveDateTime>,
 ) -> Result<Timestamp, EvalError> {
@@ -114,7 +122,8 @@ fn cast_timestamp_to_mz_timestamp(
 #[sqlfunc(
     sqlname = "date_to_mz_timestamp",
     preserves_uniqueness = true,
-    is_monotone = true
+    is_monotone = true,
+    has_convex_domain = true
 )]
 fn cast_date_to_mz_timestamp(a: Date) -> Result<Timestamp, EvalError> {
     let ts = CheckedTimestamp::try_from(NaiveDate::from(a).and_hms_opt(0, 0, 0).unwrap())?;
