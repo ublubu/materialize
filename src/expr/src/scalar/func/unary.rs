@@ -103,6 +103,12 @@ pub trait LazyUnaryFunc {
     /// ie. the argument and the result are non-error datums.
     fn is_monotone(&self) -> bool;
 
+    /// Returns true if `f(a)` and `f(b)` not erroring means `f(x)` doesn't error for any `x`
+    /// between `a` and `b`. Then if neither end of an input range errors, nothing in it does.
+    fn has_convex_domain(&self) -> bool {
+        false
+    }
+
     /// Returns true if the function does no actual work, but is merely a type-tracking cast.
     fn is_eliminable_cast(&self) -> bool;
 }
@@ -149,6 +155,10 @@ pub trait EagerUnaryFunc {
     }
 
     fn is_monotone(&self) -> bool {
+        false
+    }
+
+    fn has_convex_domain(&self) -> bool {
         false
     }
 
@@ -202,6 +212,10 @@ impl<T: EagerUnaryFunc> LazyUnaryFunc for T {
 
     fn is_monotone(&self) -> bool {
         self.is_monotone()
+    }
+
+    fn has_convex_domain(&self) -> bool {
+        self.has_convex_domain()
     }
 
     fn is_eliminable_cast(&self) -> bool {

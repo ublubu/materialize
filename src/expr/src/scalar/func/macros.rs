@@ -246,6 +246,11 @@ macro_rules! derive_unary {
                     $(Self::$name(f) => LazyUnaryFunc::is_monotone(f),)*
                 }
             }
+            pub fn has_convex_domain(&self) -> bool {
+                match self {
+                    $(Self::$name(f) => LazyUnaryFunc::has_convex_domain(f),)*
+                }
+            }
             pub fn could_error(&self) -> bool {
                 match self {
                     $(Self::$name(f) => LazyUnaryFunc::could_error(f),)*

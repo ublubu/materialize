@@ -28,6 +28,8 @@ pub(crate) struct Modifiers {
     /// Whether `is_monotone`'s endpoint-sampling guarantee still holds when an operand
     /// may be infinite. Set `false` for multiplication and division.
     is_infinity_monotone: Option<Expr>,
+    /// See `LazyUnaryFunc::has_convex_domain`.
+    has_convex_domain: Option<Expr>,
     /// The SQL name for the function.
     sqlname: Option<SqlName>,
     /// Whether the function preserves uniqueness.
@@ -101,6 +103,7 @@ impl Modifiers {
             Modifier::IsEliminableCast => self.is_eliminable_cast.as_ref(),
             Modifier::Negate => self.negate.as_ref(),
             Modifier::IsInfinityMonotone => self.is_infinity_monotone.as_ref(),
+            Modifier::HasConvexDomain => self.has_convex_domain.as_ref(),
             Modifier::IsAssociative => self.is_associative.as_ref(),
         }
     }

@@ -41,12 +41,13 @@ pub(crate) enum Modifier {
     IsEliminableCast,
     Negate,
     IsInfinityMonotone,
+    HasConvexDomain,
     IsAssociative,
 }
 
 impl Modifier {
     /// Every method-producing modifier.
-    pub(crate) const ALL: [Modifier; 11] = [
+    pub(crate) const ALL: [Modifier; 12] = [
         Modifier::CouldError,
         Modifier::IntroducesNulls,
         Modifier::IsMonotone,
@@ -57,6 +58,7 @@ impl Modifier {
         Modifier::IsEliminableCast,
         Modifier::Negate,
         Modifier::IsInfinityMonotone,
+        Modifier::HasConvexDomain,
         Modifier::IsAssociative,
     ];
 
@@ -73,6 +75,7 @@ impl Modifier {
             Modifier::IsEliminableCast => "is_eliminable_cast",
             Modifier::Negate => "negate",
             Modifier::IsInfinityMonotone => "is_infinity_monotone",
+            Modifier::HasConvexDomain => "has_convex_domain",
             Modifier::IsAssociative => "is_associative",
         }
     }
@@ -115,6 +118,7 @@ const UNARY_MODIFIERS: &[(Modifier, ReturnTy)] = &[
     (Modifier::IntroducesNulls, ReturnTy::Bool),
     (Modifier::Inverse, ReturnTy::OptUnaryFunc),
     (Modifier::IsMonotone, ReturnTy::Bool),
+    (Modifier::HasConvexDomain, ReturnTy::Bool),
     (Modifier::PreservesUniqueness, ReturnTy::Bool),
     (Modifier::IsEliminableCast, ReturnTy::Bool),
 ];

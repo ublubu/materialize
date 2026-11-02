@@ -276,6 +276,7 @@ fn insta_test_unary_all_modifiers() {
         output_type = i16,
         inverse = UnaryAllModifiers,
         is_monotone = true,
+        has_convex_domain = true,
         preserves_uniqueness = true,
         is_eliminable_cast = false,
         sqlname = "unary_all_modifiers",
