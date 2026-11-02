@@ -223,6 +223,15 @@ impl<'a> ResultSpec<'a> {
         }
     }
 
+    /// A spec that only matches null.
+    pub fn null_fallible() -> Self {
+        ResultSpec {
+            nullable: true,
+            fallible: true,
+            ..Self::nothing()
+        }
+    }
+
     /// A spec that only matches error values.
     pub fn fails() -> Self {
         ResultSpec {
@@ -357,9 +366,21 @@ impl<'a> ResultSpec<'a> {
     /// - tracking whether the function is monotone, in which case we can map the range by just
     ///   mapping the endpoints;
     /// - using a safe default when we can't infer a tighter bound on the set, eg. [Self::anything].
+    ///
+    /// We can rule out that the output `ResultSpec` might contain errors if:
+    /// - the input cannot contain errors
+    /// AND
+    /// - the function cannot error over the input range because:
+    ///   1. the function cannot error
+    ///   OR
+    ///   2. the function has a convex domain
+    ///      (i.e. The line between any two non-erroring inputs only contains non-erroring inputs.)
+    ///      AND the function does not error on either end of the input range.
     fn flat_map(
         &self,
         is_monotone: bool,
+        could_error: bool,
+        has_convex_domain: bool,
         mut result_map: impl FnMut(Result<Datum<'a>, EvalError>) -> ResultSpec<'a>,
     ) -> ResultSpec<'a> {
         let null_spec = if self.nullable {
@@ -384,6 +405,7 @@ impl<'a> ResultSpec<'a> {
         };
 
         let values_spec = match self.values {
+            // Case 1: We evaluate the function against every possible input.
             Values::Empty => ResultSpec::nothing(),
             // If this range contains a single datum, just call the function.
             Values::Within(min, max) if min == max => result_map(Ok(min)),
@@ -391,65 +413,114 @@ impl<'a> ResultSpec<'a> {
             Values::Within(Datum::False, Datum::True) => {
                 result_map(Ok(Datum::False)).union(result_map(Ok(Datum::True)))
             }
-            // Otherwise, if our function is monotonic, we can try mapping the input
-            // range to an output range. A range whose bounds include `NaN` is
-            // excluded: `NaN` is ordered as the maximum but is a fixed point of
+
+            // Case 2: We evaluate the function against the endpoints.
+            //
+            // N.B. The endpoints only tell us about the range if the function is monotone
+            // or if it has a convex domain.
+
+            // A range whose bounds include `NaN` is excluded:
+            // `NaN` is ordered as the maximum but is a fixed point of
             // most monotone functions, so evaluating the endpoints does not
             // bound the interior. Such ranges fall through to the
             // overapproximation below.
-            Values::Within(min, max) if is_monotone && !datum_is_nan(min) && !datum_is_nan(max) => {
+            Values::Within(min, max)
+                if (is_monotone || has_convex_domain)
+                    && !datum_is_nan(min)
+                    && !datum_is_nan(max) =>
+            {
                 let min_result = result_map(Ok(min));
                 let max_result = result_map(Ok(max));
-                // Value, null, and error are orthogonal channels. Monotonicity
-                // lets us bound the *values* by the endpoints, but only when both
-                // endpoints actually produced a value; null and error can't be
-                // bounded from value endpoints, so we just union whatever the
-                // endpoints reported on those channels. (A function that errors
-                // on an interior value while the endpoints don't is handled by
-                // the fallibility guard in `unary`/`binary`/`variadic`, not
-                // here.)
-                match (min_result, max_result) {
-                    // Both endpoints produced a value: bound the interior values
-                    // by their union, and carry any null/error from the endpoints.
-                    (
-                        ResultSpec {
-                            nullable: n1,
-                            fallible: f1,
-                            values: a_values @ Values::Within(..),
+
+                // This check is stronger than it needs to be:
+                // `!could_error` should imply that neither min_result nor max_result is fallible.
+                // But just in case that doesn't hold,
+                // we never mark the output as infallible if either result is fallible.
+                let infallible = (!could_error || has_convex_domain)
+                    && !min_result.fallible
+                    && !max_result.fallible;
+
+                if !is_monotone {
+                    // We can't say anything about the output values, only errors.
+                    if infallible {
+                        ResultSpec::any_infallible()
+                    } else {
+                        ResultSpec::anything()
+                    }
+                } else {
+                    // Value, null, and error are orthogonal channels. Monotonicity
+                    // lets us bound the *values* by the endpoints, but only when both
+                    // endpoints actually produced a value.
+                    // Null can't be bounded from value endpoints,
+                    // so we just union whatever the endpoints reported on that channel.
+                    // Errors are handled above, according to `has_convex_domain`.
+                    match (min_result, max_result) {
+                        // Both endpoints produced a value: bound the interior values
+                        // by their union, and carry any null/error from the endpoints.
+                        (
+                            ResultSpec {
+                                nullable: n1,
+                                fallible: _,
+                                values: a_values @ Values::Within(..),
+                            },
+                            ResultSpec {
+                                nullable: n2,
+                                fallible: _,
+                                values: b_values @ Values::Within(..),
+                            },
+                        ) => ResultSpec {
+                            nullable: n1 || n2,
+                            fallible: !infallible,
+                            values: a_values.union(b_values),
                         },
-                        ResultSpec {
-                            nullable: n2,
-                            fallible: f2,
-                            values: b_values @ Values::Within(..),
-                        },
-                    ) => ResultSpec {
-                        nullable: n1 || n2,
-                        fallible: f1 || f2,
-                        values: a_values.union(b_values),
-                    },
-                    // If both endpoints map purely to null, assume the whole
-                    // range maps to null. (Both endpoints *erroring* is NOT
-                    // enough: an interior input can still produce a value, e.g.
-                    // a cast that rejects both bounds but accepts a value
-                    // between them.)
-                    (
-                        ResultSpec {
-                            nullable: true,
-                            fallible: false,
-                            values: Values::Empty,
-                        },
-                        ResultSpec {
-                            nullable: true,
-                            fallible: false,
-                            values: Values::Empty,
-                        },
-                    ) => ResultSpec::null(),
-                    // Otherwise we can't bound the interior values.
-                    _ => ResultSpec::anything(),
+                        // If both endpoints map purely to null, assume the whole
+                        // range maps to null. (Both endpoints *erroring* is NOT
+                        // enough: an interior input can still produce a value, e.g.
+                        // a cast that rejects both bounds but accepts a value
+                        // between them.)
+                        (
+                            ResultSpec {
+                                nullable: true,
+                                fallible: _,
+                                values: Values::Empty,
+                            },
+                            ResultSpec {
+                                nullable: true,
+                                fallible: _,
+                                values: Values::Empty,
+                            },
+                        ) => {
+                            if infallible {
+                                ResultSpec::null()
+                            } else {
+                                ResultSpec::null_fallible()
+                            }
+                        }
+                        // Otherwise we can't bound the interior values.
+                        _ => {
+                            if infallible {
+                                ResultSpec::any_infallible()
+                            } else {
+                                ResultSpec::anything()
+                            }
+                        }
+                    }
                 }
             }
+
+            // Case 3: We give up. We refuse to say anything about the output values.
+            // ...but we can still make statements about errors.
+
             // TODO: we could return a narrower result for eg. `Values::Nested` with all-`Within` fields.
-            Values::Within(_, _) | Values::Nested(_) | Values::All => ResultSpec::anything(),
+            Values::Within(_, _) | Values::Nested(_) | Values::All => {
+                if could_error {
+                    // We refuse to actually evaluate the function,
+                    // so we have no endpoints to use with `has_convex_domain`.
+                    ResultSpec::anything()
+                } else {
+                    ResultSpec::any_infallible()
+                }
+            }
         };
 
         null_spec.union(error_spec).union(values_spec)
