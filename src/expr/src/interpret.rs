@@ -223,15 +223,6 @@ impl<'a> ResultSpec<'a> {
         }
     }
 
-    /// A spec that only matches null.
-    pub fn null_fallible() -> Self {
-        ResultSpec {
-            nullable: true,
-            fallible: true,
-            ..Self::nothing()
-        }
-    }
-
     /// A spec that only matches error values.
     pub fn fails() -> Self {
         ResultSpec {
@@ -334,17 +325,6 @@ impl<'a> ResultSpec<'a> {
         self.fallible
     }
 
-    /// Whether this spec is pinned to a single concrete (non-null) value.
-    ///
-    /// When it is, evaluating a function on the input is exact rather than an
-    /// endpoint-sampled approximation of a range, so the interpreter can trust
-    /// the sampled fallibility. When it isn't, endpoint sampling cannot prove a
-    /// `could_error` function infallible over the range (see the fallibility
-    /// handling in [`ColumnSpecs::unary`] and friends).
-    fn is_single_value(&self) -> bool {
-        self.values.as_single().is_some()
-    }
-
     /// Whether the value range might include a floating-point or numeric
     /// infinity. Infinities sort at the extremes of the order, so a `Within`
     /// range includes one only as an endpoint.
@@ -367,19 +347,14 @@ impl<'a> ResultSpec<'a> {
     ///   mapping the endpoints;
     /// - using a safe default when we can't infer a tighter bound on the set, eg. [Self::anything].
     ///
-    /// We can rule out that the output `ResultSpec` might contain errors if:
-    /// - the input cannot contain errors
-    /// AND
-    /// - the function cannot error over the input range because:
-    ///   1. the function cannot error
-    ///   OR
-    ///   2. the function has a convex domain
-    ///      (i.e. The line between any two non-erroring inputs only contains non-erroring inputs.)
-    ///      AND the function does not error on either end of the input range.
+    /// Over a range, the output is infallible only if the input is infallible, the function
+    /// has a convex domain (every input between two non-erroring inputs is non-erroring),
+    /// and the function does not error on either end of the range. Functions that can't
+    /// error at all are left fallible here. Callers clear that by intersecting with
+    /// [`ResultSpec::has_type`].
     fn flat_map(
         &self,
         is_monotone: bool,
-        could_error: bool,
         has_convex_domain: bool,
         mut result_map: impl FnMut(Result<Datum<'a>, EvalError>) -> ResultSpec<'a>,
     ) -> ResultSpec<'a> {
@@ -414,11 +389,9 @@ impl<'a> ResultSpec<'a> {
                 result_map(Ok(Datum::False)).union(result_map(Ok(Datum::True)))
             }
 
-            // Case 2: We evaluate the function against the endpoints.
+            // Case 2: We evaluate the function against the endpoints. The endpoints only
+            // tell us about the range if the function is monotone or has a convex domain.
             //
-            // N.B. The endpoints only tell us about the range if the function is monotone
-            // or if it has a convex domain.
-
             // A range whose bounds include `NaN` is excluded:
             // `NaN` is ordered as the maximum but is a fixed point of
             // most monotone functions, so evaluating the endpoints does not
@@ -432,95 +405,58 @@ impl<'a> ResultSpec<'a> {
                 let min_result = result_map(Ok(min));
                 let max_result = result_map(Ok(max));
 
-                // This check is stronger than it needs to be:
-                // `!could_error` should imply that neither min_result nor max_result is fallible.
-                // But just in case that doesn't hold,
-                // we never mark the output as infallible if either result is fallible.
-                let infallible = (!could_error || has_convex_domain)
-                    && !min_result.fallible
-                    && !max_result.fallible;
+                let infallible = has_convex_domain && !min_result.fallible && !max_result.fallible;
 
-                if !is_monotone {
-                    // We can't say anything about the output values, only errors.
-                    if infallible {
-                        ResultSpec::any_infallible()
-                    } else {
-                        ResultSpec::anything()
-                    }
-                } else {
-                    // Value, null, and error are orthogonal channels. Monotonicity
-                    // lets us bound the *values* by the endpoints, but only when both
-                    // endpoints actually produced a value.
-                    // Null can't be bounded from value endpoints,
-                    // so we just union whatever the endpoints reported on that channel.
-                    // Errors are handled above, according to `has_convex_domain`.
-                    match (min_result, max_result) {
-                        // Both endpoints produced a value: bound the interior values
-                        // by their union, and carry any null/error from the endpoints.
-                        (
-                            ResultSpec {
-                                nullable: n1,
-                                fallible: _,
-                                values: a_values @ Values::Within(..),
-                            },
-                            ResultSpec {
-                                nullable: n2,
-                                fallible: _,
-                                values: b_values @ Values::Within(..),
-                            },
-                        ) => ResultSpec {
-                            nullable: n1 || n2,
-                            fallible: !infallible,
-                            values: a_values.union(b_values),
+                // Value, null, and error are orthogonal channels. Monotonicity
+                // lets us bound the *values* by the endpoints, but only when both
+                // endpoints actually produced a value. Null can't be bounded from
+                // value endpoints, so we union whatever the endpoints reported.
+                // Errors are set from `infallible` below.
+                let mut spec = match (min_result, max_result) {
+                    _ if !is_monotone => ResultSpec::any_infallible(),
+                    (
+                        ResultSpec {
+                            nullable: n1,
+                            values: a_values @ Values::Within(..),
+                            ..
                         },
-                        // If both endpoints map purely to null, assume the whole
-                        // range maps to null. (Both endpoints *erroring* is NOT
-                        // enough: an interior input can still produce a value, e.g.
-                        // a cast that rejects both bounds but accepts a value
-                        // between them.)
-                        (
-                            ResultSpec {
-                                nullable: true,
-                                fallible: _,
-                                values: Values::Empty,
-                            },
-                            ResultSpec {
-                                nullable: true,
-                                fallible: _,
-                                values: Values::Empty,
-                            },
-                        ) => {
-                            if infallible {
-                                ResultSpec::null()
-                            } else {
-                                ResultSpec::null_fallible()
-                            }
-                        }
-                        // Otherwise we can't bound the interior values.
-                        _ => {
-                            if infallible {
-                                ResultSpec::any_infallible()
-                            } else {
-                                ResultSpec::anything()
-                            }
-                        }
-                    }
-                }
+                        ResultSpec {
+                            nullable: n2,
+                            values: b_values @ Values::Within(..),
+                            ..
+                        },
+                    ) => ResultSpec {
+                        nullable: n1 || n2,
+                        fallible: false,
+                        values: a_values.union(b_values),
+                    },
+                    // If both endpoints map purely to null, assume the whole
+                    // range maps to null. (An endpoint that may also *error* is
+                    // NOT enough: an interior input can still produce a value, e.g.
+                    // a cast that rejects both bounds but accepts a value
+                    // between them.)
+                    (
+                        ResultSpec {
+                            nullable: true,
+                            fallible: false,
+                            values: Values::Empty,
+                        },
+                        ResultSpec {
+                            nullable: true,
+                            fallible: false,
+                            values: Values::Empty,
+                        },
+                    ) => ResultSpec::null(),
+                    // Otherwise we can't bound the interior values.
+                    _ => ResultSpec::any_infallible(),
+                };
+                spec.fallible = !infallible;
+                spec
             }
 
-            // Case 3: We give up. We refuse to say anything about the output values.
-            // ...but we can still make statements about errors.
-
+            // Case 3: We give up.
             // TODO: we could return a narrower result for eg. `Values::Nested` with all-`Within` fields.
-            Values::Within(_, _) | Values::Nested(_) | Values::All => {
-                if could_error {
-                    // We refuse to actually evaluate the function,
-                    // so we have no endpoints to use with `has_convex_domain`.
-                    ResultSpec::anything()
-                } else {
-                    ResultSpec::any_infallible()
-                }
-            }
+            Values::Within(_, _) | Values::Nested(_) | Values::All => ResultSpec::anything(),
         };
 
         null_spec.union(error_spec).union(values_spec)
@@ -770,11 +706,11 @@ impl SpecialUnary {
 /// The abstract-domain counterpart of a [BinaryFunc]: a binary function
 /// we've added special-case handling for; including:
 /// - Either a complete override of [ResultSpec] computation, or a way to
-///   compute monotonicity dynamically from the input specs.
+///   compute monotonicity and convexity dynamically from the input specs.
 /// - Metadata on whether / not this function is pushdownable. See [Trace].
 ///
 /// Note: today a function can have *either* a handler override *or* a
-/// dynamic-monotonicity verdict, but not both. If a future function wants
+/// dynamic verdict, but not both. If a future function wants
 /// both, promote [AbstractFuncHandler] from an enum to a struct with two
 /// optional fields.
 struct AbstractFunc {
@@ -792,13 +728,23 @@ enum AbstractFuncHandler {
     /// Completely override the spec computation; the default flat-map machinery
     /// is bypassed.
     Override(for<'a> fn(ResultSpec<'a>, ResultSpec<'a>) -> ResultSpec<'a>),
-    /// Use the default flat-map machinery, but with a monotonicity verdict that
-    /// depends on the input specs. This lets us claim monotonicity for cases
-    /// the static `LazyBinaryFunc::is_monotone` annotation can't safely claim:
+    /// Use the default flat-map machinery, but with monotonicity and convexity
+    /// verdicts that depend on the input specs. This lets us claim properties
+    /// the static `LazyBinaryFunc` annotations can't safely claim:
     /// for instance, `t + INTERVAL '1' day` is monotone in `t`, but `t + i`
     /// generally isn't (the calendar-month / day-clamping arithmetic in
     /// `add_timestamp_interval` is non-monotone when `i.months != 0`).
-    DynamicMonotone(fn(&ResultSpec<'_>, &ResultSpec<'_>) -> (bool, bool)),
+    Dynamic(fn(&ResultSpec<'_>, &ResultSpec<'_>) -> DynamicProps),
+}
+
+/// Properties of a binary function that hold for particular input specs.
+struct DynamicProps {
+    /// `(left, right)`, as in `LazyBinaryFunc::is_monotone`.
+    monotone: (bool, bool),
+    /// For every value the other argument's spec allows, the inputs to this
+    /// argument that don't error form one unbroken range, in the sense of
+    /// `LazyUnaryFunc::has_convex_domain`. Must hold for both arguments.
+    convex_domain: bool,
 }
 
 impl AbstractFunc {
@@ -891,15 +837,22 @@ impl AbstractFunc {
         /// annotation has to pick the conservative answer; this dynamic check
         /// recovers filter pushdown for the common case of literal
         /// `INTERVAL '<N>' day`-style predicates.
-        fn timestamp_plus_interval_monotone(
+        ///
+        /// Adding a fixed number of microseconds errors only when the result
+        /// leaves the timestamp range, so for a single such interval the
+        /// timestamps that don't error are one unbroken range.
+        fn timestamp_plus_interval_props(
             _left: &ResultSpec<'_>,
             right: &ResultSpec<'_>,
-        ) -> (bool, bool) {
+        ) -> DynamicProps {
             let months_zero = matches!(
                 right.values.as_single(),
                 Some(Datum::Interval(i)) if i.months == 0,
             );
-            (months_zero, months_zero)
+            DynamicProps {
+                monotone: (months_zero, months_zero),
+                convex_domain: months_zero,
+            }
         }
 
         match func {
@@ -919,7 +872,7 @@ impl AbstractFunc {
             | BinaryFunc::AddTimestampTzInterval(_)
             | BinaryFunc::SubTimestampInterval(_)
             | BinaryFunc::SubTimestampTzInterval(_) => Some(AbstractFunc {
-                handler: AbstractFuncHandler::DynamicMonotone(timestamp_plus_interval_monotone),
+                handler: AbstractFuncHandler::Dynamic(timestamp_plus_interval_props),
                 // For [Trace]: we *might* be pushdownable in the first argument
                 // (we are when the interval is a literal with no months). The
                 // interval argument is reported as non-pushdownable so that
@@ -1081,14 +1034,6 @@ impl<'a> Interpreter for ColumnSpecs<'a> {
 
     fn unary(&self, func: &UnaryFunc, summary: Self::Summary) -> Self::Summary {
         let fallible = func.could_error() || summary.range.fallible;
-        // Endpoint sampling proves a monotone function's output value range, but
-        // it cannot prove the function never errors on an interior value of a
-        // multi-valued range: monotonicity says nothing about where errors
-        // occur (e.g. `round(_, scale)` overflows on inputs whose exponent hits
-        // a bad branch, `numeric::mz_timestamp` rejects fractional inputs). So
-        // we do not let it conclude a could-error function is infallible over
-        // such a range.
-        let input_multivalued = !summary.range.is_single_value();
         let mapped_spec = if let Some(special) = SpecialUnary::for_func(func) {
             (special.map_fn)(self, summary.range)
         } else {
@@ -1097,21 +1042,17 @@ impl<'a> Interpreter for ColumnSpecs<'a> {
                 func: func.clone(),
                 expr: Box::new(Self::placeholder(summary.col_type.clone())),
             };
-            summary.range.flat_map(is_monotone, |datum| {
-                Self::set_argument(&mut expr, 0, datum);
-                self.eval_result(expr.eval(&[], self.arena))
-            })
+            summary
+                .range
+                .flat_map(is_monotone, func.has_convex_domain(), |datum| {
+                    Self::set_argument(&mut expr, 0, datum);
+                    self.eval_result(expr.eval(&[], self.arena))
+                })
         };
 
         let col_type = func.output_type(summary.col_type);
 
-        let mut range = mapped_spec.intersect(ResultSpec::has_type(&col_type, fallible));
-        // `intersect` only ANDs the fallible flag, so `has_type` above narrows
-        // the value and null domain but cannot surface an error that endpoint
-        // sampling missed. Force it for a could-error function over a range.
-        if fallible && input_multivalued {
-            range.fallible = true;
-        }
+        let range = mapped_spec.intersect(ResultSpec::has_type(&col_type, fallible));
         ColumnSpec { col_type, range }
     }
 
@@ -1122,18 +1063,21 @@ impl<'a> Interpreter for ColumnSpecs<'a> {
         right: Self::Summary,
     ) -> Self::Summary {
         let fallible = func.could_error() || left.range.fallible || right.range.fallible;
-        // See the note in `unary`: endpoint sampling cannot rule out an interior
-        // error, so a could-error function is fallible over a multi-valued range.
-        let inputs_multivalued = !left.range.is_single_value() || !right.range.is_single_value();
         let operand_may_be_infinite = left.range.may_be_infinite() || right.range.may_be_infinite();
 
         let special = AbstractFunc::for_func(func);
-        let (left_monotonic, right_monotonic) = match &special {
+        let DynamicProps {
+            monotone: (left_monotonic, right_monotonic),
+            convex_domain,
+        } = match &special {
             Some(AbstractFunc {
-                handler: AbstractFuncHandler::DynamicMonotone(monotone_fn),
+                handler: AbstractFuncHandler::Dynamic(props_fn),
                 ..
-            }) => monotone_fn(&left.range, &right.range),
-            _ => func.is_monotone(),
+            }) => props_fn(&left.range, &right.range),
+            _ => DynamicProps {
+                monotone: func.is_monotone(),
+                convex_domain: false,
+            },
         };
 
         let mapped_spec = match special {
@@ -1147,24 +1091,22 @@ impl<'a> Interpreter for ColumnSpecs<'a> {
                     expr1: Box::new(Self::placeholder(left.col_type.clone())),
                     expr2: Box::new(Self::placeholder(right.col_type.clone())),
                 };
-                left.range.flat_map(left_monotonic, |left_result| {
-                    Self::set_argument(&mut expr, 0, left_result);
-                    right.range.flat_map(right_monotonic, |right_result| {
-                        Self::set_argument(&mut expr, 1, right_result);
-                        self.eval_result(expr.eval(&[], self.arena))
+                left.range
+                    .flat_map(left_monotonic, convex_domain, |left_result| {
+                        Self::set_argument(&mut expr, 0, left_result);
+                        right
+                            .range
+                            .flat_map(right_monotonic, convex_domain, |right_result| {
+                                Self::set_argument(&mut expr, 1, right_result);
+                                self.eval_result(expr.eval(&[], self.arena))
+                            })
                     })
-                })
             }
         };
 
         let col_type = func.output_type(&[left.col_type, right.col_type]);
 
         let mut range = mapped_spec.intersect(ResultSpec::has_type(&col_type, fallible));
-        // `intersect` only ANDs the fallible flag, so force the interior
-        // fallibility it cannot add (see the note in `unary`).
-        if fallible && inputs_multivalued {
-            range.fallible = true;
-        }
         // Some functions (multiplication, division) are not corner-sampleable
         // when an operand may be infinite: their indeterminate forms (`∞ * 0`,
         // `∞ / ∞`) evaluate to a value the endpoints don't bound, and that value
@@ -1180,7 +1122,6 @@ impl<'a> Interpreter for ColumnSpecs<'a> {
 
     fn variadic(&self, func: &VariadicFunc, args: Vec<Self::Summary>) -> Self::Summary {
         let fallible = func.could_error() || args.iter().any(|s| s.range.fallible);
-        let inputs_multivalued = args.iter().any(|s| !s.range.is_single_value());
         if func.is_associative() && args.len() > 2 {
             // To avoid a combinatorial explosion, evaluate large variadic calls as a series of
             // smaller ones, since associativity guarantees we'll get compatible results.
@@ -1190,11 +1131,30 @@ impl<'a> Interpreter for ColumnSpecs<'a> {
                 .expect("reducing over a non-empty argument list");
         }
 
+        // With `stride` and `origin` fixed, `date_bin` is monotone in `source`, and every error
+        // (`source` too far from `origin`, or the result out of range) happens only toward the
+        // extremes of `source`. A bad `stride` errors for every `source`.
+        // `stride` and `origin` take the single-value case in `flat_map`, so claiming both
+        // properties for every argument is sound.
+        let is_single = |i: usize| {
+            args.get(i)
+                .is_some_and(|arg| arg.range.values.as_single().is_some())
+        };
+        let (is_monotone, has_convex_domain) = match func {
+            VariadicFunc::DateBinTimestamp(_) | VariadicFunc::DateBinTimestampTz(_)
+                if is_single(0) && is_single(2) =>
+            {
+                (true, true)
+            }
+            _ => (func.is_monotone(), false),
+        };
+
         let mapped_spec = if args.len() >= Self::MAX_EVAL_ARGS {
             ResultSpec::anything()
         } else {
             fn eval_loop<'a>(
                 is_monotonic: bool,
+                has_convex_domain: bool,
                 expr: &mut MirScalarExpr,
                 args: &[ColumnSpec<'a>],
                 index: usize,
@@ -1203,10 +1163,19 @@ impl<'a> Interpreter for ColumnSpecs<'a> {
                 if index >= args.len() {
                     datum_map(expr)
                 } else {
-                    args[index].range.flat_map(is_monotonic, |datum| {
-                        ColumnSpecs::set_argument(expr, index, datum);
-                        eval_loop(is_monotonic, expr, args, index + 1, datum_map)
-                    })
+                    args[index]
+                        .range
+                        .flat_map(is_monotonic, has_convex_domain, |datum| {
+                            ColumnSpecs::set_argument(expr, index, datum);
+                            eval_loop(
+                                is_monotonic,
+                                has_convex_domain,
+                                expr,
+                                args,
+                                index + 1,
+                                datum_map,
+                            )
+                        })
                 }
             }
 
@@ -1217,20 +1186,20 @@ impl<'a> Interpreter for ColumnSpecs<'a> {
                     .map(|spec| Self::placeholder(spec.col_type.clone()))
                     .collect(),
             };
-            eval_loop(func.is_monotone(), &mut fn_expr, &args, 0, &mut |expr| {
-                self.eval_result(expr.eval(&[], self.arena))
-            })
+            eval_loop(
+                is_monotone,
+                has_convex_domain,
+                &mut fn_expr,
+                &args,
+                0,
+                &mut |expr| self.eval_result(expr.eval(&[], self.arena)),
+            )
         };
 
         let col_types = args.into_iter().map(|spec| spec.col_type).collect();
         let col_type = func.output_type(col_types);
 
-        let mut range = mapped_spec.intersect(ResultSpec::has_type(&col_type, fallible));
-        // `intersect` only ANDs the fallible flag, so force the interior
-        // fallibility it cannot add (see the note in `unary`).
-        if fallible && inputs_multivalued {
-            range.fallible = true;
-        }
+        let range = mapped_spec.intersect(ResultSpec::has_type(&col_type, fallible));
 
         ColumnSpec { col_type, range }
     }
@@ -1243,7 +1212,7 @@ impl<'a> Interpreter for ColumnSpecs<'a> {
 
         let range = cond
             .range
-            .flat_map(true, |datum| match datum {
+            .flat_map(true, false, |datum| match datum {
                 Ok(Datum::True) => then.range.clone(),
                 // A false OR null condition takes the `els` branch, matching
                 // `MirScalarExpr::eval` (`Datum::False | Datum::Null => els`).

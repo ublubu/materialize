@@ -391,7 +391,9 @@ pub struct ExtractTimestamp(pub DateTimeUnits);
 #[sqlfunc(
     ExtractTimestamp,
     skip_display = true,
-    is_monotone = most_significant_unit(self.0)
+    is_monotone = most_significant_unit(self.0),
+    // Whether `date_part_timestamp_inner` errors depends only on the unit.
+    has_convex_domain = true
 )]
 fn extract_timestamp(&self, a: CheckedTimestamp<NaiveDateTime>) -> Result<Numeric, EvalError> {
     date_part_timestamp_inner(self.0, &*a)
@@ -422,7 +424,9 @@ pub struct ExtractTimestampTz(pub DateTimeUnits);
     // Unlike the timezone-less timestamp, it's not safe to extract the "high-order bits" like
     // year: year takes timezone into account, and it's quite possible for a different timezone
     // to be in a previous year while having a later UTC-equivalent time.
-    is_monotone = self.0 == DateTimeUnits::Epoch
+    is_monotone = self.0 == DateTimeUnits::Epoch,
+    // Whether `date_part_timestamp_inner` errors depends only on the unit.
+    has_convex_domain = true
 )]
 fn extract_timestamp_tz(&self, a: CheckedTimestamp<DateTime<Utc>>) -> Result<Numeric, EvalError> {
     date_part_timestamp_inner(self.0, &*a)

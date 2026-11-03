@@ -168,7 +168,8 @@ fn cast_mz_timestamp_to_timestamp_tz(
 #[sqlfunc(
     sqlname = "step_mz_timestamp",
     preserves_uniqueness = true,
-    is_monotone = true
+    is_monotone = true,
+    has_convex_domain = true
 )]
 fn step_mz_timestamp(a: Timestamp) -> Result<Timestamp, EvalError> {
     a.checked_add(1).ok_or(EvalError::MzTimestampStepOverflow)
